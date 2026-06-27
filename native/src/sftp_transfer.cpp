@@ -430,12 +430,7 @@ scp_error_t SftpTransfer::DoUpload() {
 }
 
 // =========================================================================
-//  Download — non-blocking pipelined reads for high throughput
-// =========================================================================
-// Switches the SSH session to non-blocking mode temporarily so that
-// pipelined SFTP READ requests can be issued without waiting for each
-// response.  Multiple reads stay in-flight concurrently, saturating
-// high-bandwidth links that would otherwise be bottlenecked by RTT.
+//  Download — sequential blocking (reliable)
 // =========================================================================
 
 scp_error_t SftpTransfer::DoDownload() {
@@ -456,68 +451,57 @@ scp_error_t SftpTransfer::DoDownload() {
 
   // Resume support
   uint64_t resume_offset = 0;
+  const char* open_mode = "wb";
   if (config_.resume) {
     FILE* f = fopen(local_path, "rb");
     if (f) {
       fseeko(f, 0, SEEK_END);
-      resume_offset = ftello(f);
+      uint64_t local_size = ftello(f);
       fclose(f);
-      if (resume_offset > total_size) resume_offset = 0;
-      SCP_LOG_INFO("Resuming download from offset %llu/%llu",
-                   (unsigned long long)resume_offset,
-                   (unsigned long long)total_size);
+      if (local_size < total_size) {
+        resume_offset = local_size;
+        open_mode = "ab";
+        SCP_LOG_INFO("Resuming download from offset %llu/%llu",
+                     (unsigned long long)resume_offset,
+                     (unsigned long long)total_size);
+      }
     }
   }
 
-  // Pre-allocate output file for parallel writes
-  FILE* local_file = fopen(local_path, "wb+");
+  FILE* local_file = fopen(local_path, open_mode);
   if (!local_file) {
     SCP_LOG_ERROR("Failed to open local file for download: %s", local_path);
     return SCP_ERROR_FILE_OPEN;
   }
+  // Large stdio buffer reduces write() syscall frequency
   setvbuf(local_file, nullptr, _IOFBF, 1024 * 1024);
-  if (resume_offset == 0) {
-    fseeko(local_file, static_cast<int64_t>(total_size - 1), SEEK_SET);
-    fputc(0, local_file);  // ensure file size
-    fseeko(local_file, 0, SEEK_SET);
+
+  LIBSSH2_SFTP_HANDLE* remote_handle = libssh2_sftp_open(
+      sftp, remote_path, LIBSSH2_FXF_READ, 0);
+  if (!remote_handle) {
+    fclose(local_file);
+    SCP_LOG_ERROR("Failed to open remote file for download: %s", remote_path);
+    return SCP_ERROR_FILE_OPEN;
   }
 
-  // Switch SSH session to non-blocking for pipelined reads
-  LIBSSH2_SESSION* session = conn_->GetSshSession();
-  libssh2_session_set_blocking(session, 0);
-
-  constexpr int kWorkers = 6;
-  const uint64_t chunk = (total_size / kWorkers + 1);
-
-  struct Worker {
-    LIBSSH2_SFTP_HANDLE* h = nullptr;
-    uint64_t start, end, pos;
-    std::vector<char> buf;
-    ssize_t pending = -1;  // -1 = idle, >= 0 = bytes just received
-    bool eof = false;
-  };
-  std::vector<Worker> w(kWorkers);
-  for (int i = 0; i < kWorkers; ++i) {
-    auto& wk = w[i];
-    wk.start = i * chunk;
-    wk.end   = std::min(wk.start + chunk, total_size);
-    wk.pos   = wk.start;
-    if (wk.start >= total_size) continue;
-    wk.buf.resize(256 * 1024);
-    wk.h = libssh2_sftp_open(sftp, remote_path, LIBSSH2_FXF_READ, 0);
-    if (wk.h) libssh2_sftp_seek64(wk.h, wk.start);
+  if (resume_offset > 0) {
+    libssh2_sftp_seek64(remote_handle, resume_offset);
   }
 
-  uint64_t bytes_received = 0;
+  ScopedBuffer<char> block(config_.block_size);
+  if (!block) {
+    libssh2_sftp_close(remote_handle);
+    fclose(local_file);
+    return SCP_ERROR_MEMORY;
+  }
 
-  // Main event loop: issue reads on idle workers, poll socket, collect results
+  uint64_t bytes_received = resume_offset;
+
   while (bytes_received < total_size) {
-    // Pause / cancel
     {
       TransferState st;
       if (ShouldStop(this, &st)) {
-        libssh2_session_set_blocking(session, 1);
-        for (auto& wk : w) if (wk.h) libssh2_sftp_close(wk.h);
+        libssh2_sftp_close(remote_handle);
         fclose(local_file);
         if (st == TransferState::kCancelled) return SCP_ERROR_CANCELLED;
         return SCP_ERROR_PAUSED;
@@ -525,65 +509,32 @@ scp_error_t SftpTransfer::DoDownload() {
       WaitWhilePaused(pause_mutex_, pause_cv_, paused_flag_, this);
     }
 
-    // ---- PHASE 1: collect completed reads and write to disk ----
-    for (auto& wk : w) {
-      if (wk.pending < 0) continue;
-      if (wk.pending == 0) { wk.eof = true; wk.pending = -1; continue; }
+    size_t to_read = static_cast<size_t>(
+        std::min<uint64_t>(config_.block_size, total_size - bytes_received));
+    ssize_t rc = libssh2_sftp_read(remote_handle, block.get(), to_read);
+    if (rc < 0) {
+      SCP_LOG_ERROR("SFTP read failed at offset %llu",
+                    (unsigned long long)bytes_received);
+      libssh2_sftp_close(remote_handle);
+      fclose(local_file);
+      return SCP_ERROR_REMOTE_IO;
+    }
+    if (rc == 0) break;  // EOF
 
-      fseeko(local_file, static_cast<int64_t>(wk.pos), SEEK_SET);
-      fwrite(wk.buf.data(), 1, wk.pending, local_file);
-      wk.pos += wk.pending;
-      bytes_received += wk.pending;
-      wk.pending = -1;
-      if (wk.pos >= wk.end) wk.eof = true;
-
-      bytes_transferred_.store(bytes_received, std::memory_order_release);
-      ReportProgress(bytes_received, total_size);
+    size_t written = fwrite(block.get(), 1, rc, local_file);
+    if (written != static_cast<size_t>(rc)) {
+      SCP_LOG_ERROR("Failed to write local file: %s (disk full?)", local_path);
+      libssh2_sftp_close(remote_handle);
+      fclose(local_file);
+      return (errno == ENOSPC) ? SCP_ERROR_DISK_FULL : SCP_ERROR_FILE_WRITE;
     }
 
-    // ---- PHASE 2: try to read on each non-done worker ----
-    bool any_waiting = false;
-    for (auto& wk : w) {
-      if (wk.eof || !wk.h || wk.pos >= wk.end) continue;
-      if (wk.pending >= 0) continue;  // already has data to flush
-
-      size_t n = static_cast<size_t>(
-          std::min<uint64_t>(wk.buf.size(), wk.end - wk.pos));
-      ssize_t rc = libssh2_sftp_read(wk.h, wk.buf.data(), n);
-      if (rc > 0) {
-        wk.pending = rc;
-      } else if (rc == LIBSSH2_ERROR_EAGAIN) {
-        any_waiting = true;
-      } else if (rc < 0) {
-        wk.eof = true;
-      } else {
-        wk.pending = 0;  // rc == 0 -> EOF
-      }
-    }
-
-    // ---- PHASE 3: pump libssh2 transport and poll socket ----
-    bool any_active = false;
-    for (auto& wk : w) { if (!wk.eof && wk.h && wk.pos < wk.end) { any_active = true; break; } }
-    if (!any_active) break;
-
-    if (any_waiting) {
-      int dirs = libssh2_session_block_directions(session);
-      struct pollfd pfd;
-      pfd.fd     = conn_->GetSocketFd();
-      pfd.events = 0;
-      if (dirs & LIBSSH2_SESSION_BLOCK_INBOUND)  pfd.events |= POLLIN;
-      if (dirs & LIBSSH2_SESSION_BLOCK_OUTBOUND) pfd.events |= POLLOUT;
-      if (pfd.events) {
-        int pret = poll(&pfd, 1, 100);
-        if (pret < 0 && errno != EINTR) break;
-      }
-    }
+    bytes_received += rc;
+    bytes_transferred_.store(bytes_received, std::memory_order_release);
+    ReportProgress(bytes_received, total_size);
   }
 
-  // Restore blocking mode
-  libssh2_session_set_blocking(session, 1);
-
-  for (auto& wk : w) if (wk.h) libssh2_sftp_close(wk.h);
+  libssh2_sftp_close(remote_handle);
   fclose(local_file);
 
   SCP_LOG_INFO("Download complete: %s -> %s (%llu bytes)",
