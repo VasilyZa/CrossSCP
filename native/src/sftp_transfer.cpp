@@ -46,9 +46,13 @@ static uint32_t ClampUint32(uint32_t val, uint32_t min_val, uint32_t max_val) {
 //  while the main transfer thread writes to the SFTP channel.
 // ---------------------------------------------------------------------------
 struct UploadPipeline {
+  struct Block {
+    size_t idx;
+    size_t bytes;  // actual bytes read from local file
+  };
   std::vector<std::vector<char>> buffers;
-  std::deque<size_t> ready;       // indices: blocks ready for SFTP write
-  std::deque<size_t> free_slots;  // indices: blocks the reader may fill
+  std::deque<Block> ready;       // blocks ready for SFTP write
+  std::deque<size_t> free_slots; // indices: blocks the reader may fill
   std::mutex mtx;
   std::condition_variable cv;
   bool reader_eof{false};
@@ -311,7 +315,7 @@ scp_error_t SftpTransfer::DoUpload() {
         pipe.reader_eof = true;
         {
           std::lock_guard<std::mutex> lock(pipe.mtx);
-          pipe.ready.push_back(idx);
+          pipe.ready.push_back({idx, 0});
         }
         pipe.cv.notify_one();
         return;
@@ -319,7 +323,7 @@ scp_error_t SftpTransfer::DoUpload() {
 
       {
         std::lock_guard<std::mutex> lock(pipe.mtx);
-        pipe.ready.push_back(idx);
+        pipe.ready.push_back({idx, bytes});
       }
       pipe.cv.notify_one();
 
@@ -358,7 +362,7 @@ scp_error_t SftpTransfer::DoUpload() {
       pending_free.pop_front();
     }
 
-    size_t idx;
+    UploadPipeline::Block blk;
     {
       std::unique_lock<std::mutex> lock(pipe.mtx);
       // Block until there's data to write, or reader is finished/errored.
@@ -372,14 +376,14 @@ scp_error_t SftpTransfer::DoUpload() {
       }
       if (pipe.ready.empty() && pipe.reader_eof) break;
       if (TransferCancelled(this)) { result = SCP_ERROR_CANCELLED; break; }
-      idx = pipe.ready.front();
+      blk = pipe.ready.front();
       pipe.ready.pop_front();
     }
 
-    size_t to_write = static_cast<size_t>(
-        std::min<uint64_t>(config_.block_size, total_size - bytes_sent));
+    if (blk.bytes == 0) continue;  // empty block from EOF signal
+
     ssize_t rc = libssh2_sftp_write(remote_handle,
-                                    pipe.buffers[idx].data(), to_write);
+                                    pipe.buffers[blk.idx].data(), blk.bytes);
     if (rc < 0) {
       SCP_LOG_ERROR("SFTP write failed at offset %llu",
                     (unsigned long long)bytes_sent);
@@ -392,7 +396,7 @@ scp_error_t SftpTransfer::DoUpload() {
     ReportProgress(bytes_sent, total_size);
 
     // Defer returning this block to avoid holding pipe.mtx during SFTP write.
-    pending_free.push_back(idx);
+    pending_free.push_back(blk.idx);
 
     // If there's a pending error from the reader that we haven't processed
     {

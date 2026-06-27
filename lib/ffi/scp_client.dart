@@ -112,7 +112,7 @@ void _wTransferStart(int id, SendPort r, List msg) {
   cfg.ref.localPath = local.cast();
   cfg.ref.remotePath = remote.cast();
   cfg.ref.maxConcurrent = 32;
-  cfg.ref.blockSize = 256 * 1024;
+  cfg.ref.blockSize = 0;  // 0 = use native default (2 MB)
   cfg.ref.progressThrottleMs = 100;
   final out = calloc<IntPtr>();
   final code = bind.scpTransferStart(msg[2] as int, cfg, out);
