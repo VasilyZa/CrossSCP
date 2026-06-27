@@ -58,28 +58,34 @@ set(SCP_SOURCES
 # Dependencies: libssh2
 # =============================================================================
 
-# Try to find system-installed libssh2
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-    pkg_check_modules(LIBSSH2 QUIET libssh2)
-endif()
-
-if(LIBSSH2_FOUND)
-    message(STATUS "Found system libssh2: ${LIBSSH2_LIBRARIES}")
+find_package(libssh2 QUIET)
+if(libssh2_FOUND)
+    message(STATUS "Found libssh2 via CMake config")
+    set(LIBSSH2_LIBRARIES libssh2::libssh2)
+    get_target_property(LIBSSH2_INCLUDE_DIRS libssh2::libssh2 INTERFACE_INCLUDE_DIRECTORIES)
 else()
-    # Fallback: try find_library
-    find_library(LIBSSH2_LIBRARIES NAMES ssh2 libssh2
-        PATHS /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu
-              /opt/homebrew/lib /opt/local/lib)
-    find_path(LIBSSH2_INCLUDE_DIRS libssh2.h
-        PATHS /usr/include /usr/local/include
-              /opt/homebrew/include /opt/local/include)
-
-    if(NOT LIBSSH2_LIBRARIES OR NOT LIBSSH2_INCLUDE_DIRS)
-        message(FATAL_ERROR "libssh2 not found. Install libssh2-dev (Linux), "
-                "libssh2 (macOS Homebrew), or build from source.")
+    # Try pkg-config
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(LIBSSH2 QUIET libssh2)
     endif()
-    set(LIBSSH2_INCLUDE_DIRS ${LIBSSH2_INCLUDE_DIRS})
+    if(NOT LIBSSH2_FOUND)
+        # Fallback: try find_library with vcpkg paths
+        find_library(LIBSSH2_LIBRARIES NAMES ssh2 libssh2
+            PATHS
+                /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu
+                /opt/homebrew/lib /opt/local/lib
+                "$ENV{VCPKG_INSTALLED_DIR}/lib"
+                "C:/vcpkg/installed/x64-windows/lib"
+        )
+        find_path(LIBSSH2_INCLUDE_DIRS libssh2.h
+            PATHS
+                /usr/include /usr/local/include
+                /opt/homebrew/include /opt/local/include
+                "$ENV{VCPKG_INSTALLED_DIR}/include"
+                "C:/vcpkg/installed/x64-windows/include"
+        )
+    endif()
 endif()
 
 # =============================================================================
@@ -95,9 +101,26 @@ if(USE_MBEDTLS)
     set(CRYPTO_LIBRARIES mbedtls mbedx509 mbedcrypto)
     message(STATUS "Using mbedTLS for crypto")
 else()
-    find_package(OpenSSL REQUIRED)
-    set(CRYPTO_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
-    message(STATUS "Using OpenSSL for crypto (${OPENSSL_VERSION})")
+    find_package(OpenSSL QUIET)
+    if(OpenSSL_FOUND)
+        set(CRYPTO_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
+        message(STATUS "Using OpenSSL for crypto (${OPENSSL_VERSION})")
+    else()
+        # Try vcpkg paths
+        find_library(OPENSSL_SSL_LIB NAMES ssl libssl
+            PATHS "C:/vcpkg/installed/x64-windows/lib" "$ENV{VCPKG_INSTALLED_DIR}/lib")
+        find_library(OPENSSL_CRYPTO_LIB NAMES crypto libcrypto
+            PATHS "C:/vcpkg/installed/x64-windows/lib" "$ENV{VCPKG_INSTALLED_DIR}/lib")
+        find_path(OPENSSL_INCLUDE_DIR openssl/ssl.h
+            PATHS "C:/vcpkg/installed/x64-windows/include" "$ENV{VCPKG_INSTALLED_DIR}/include")
+        if(OPENSSL_SSL_LIB AND OPENSSL_CRYPTO_LIB AND OPENSSL_INCLUDE_DIR)
+            set(CRYPTO_LIBRARIES ${OPENSSL_SSL_LIB} ${OPENSSL_CRYPTO_LIB})
+            set(OPENSSL_INCLUDE_DIRS ${OPENSSL_INCLUDE_DIR})
+            message(STATUS "Found OpenSSL via vcpkg")
+        else()
+            message(FATAL_ERROR "OpenSSL not found")
+        endif()
+    endif()
 endif()
 
 # =============================================================================
@@ -117,6 +140,7 @@ target_include_directories(scp_native
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${LIBSSH2_INCLUDE_DIRS}
+        ${OPENSSL_INCLUDE_DIRS}
 )
 
 target_link_libraries(scp_native
@@ -126,6 +150,7 @@ target_link_libraries(scp_native
 )
 
 target_compile_definitions(scp_native PRIVATE
+    SCP_BUILDING_DLL
     SCP_VERSION="${SCP_VERSION}"
 )
 
