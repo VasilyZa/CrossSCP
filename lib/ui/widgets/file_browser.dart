@@ -42,21 +42,36 @@ class FileBrowserWidgetState extends State<FileBrowserWidget> {
   bool _loadingRemote = false;
   String? _remoteError;
 
+  String? _editingPath;
+  final _pathCtrl = TextEditingController();
+  final _pathFocus = FocusNode();
+
   @override
   void initState() {
     super.initState();
+    _pathFocus.addListener(() {
+      if (!_pathFocus.hasFocus && _editingPath != null) {
+        setState(() => _editingPath = null);
+      }
+    });
     _loadLocalDir();
+  }
+
+  @override
+  void dispose() {
+    _pathCtrl.dispose();
+    _pathFocus.dispose();
+    super.dispose();
   }
 
   @override
   void didUpdateWidget(FileBrowserWidget old) {
     super.didUpdateWidget(old);
-    if (widget.leftPath != old.leftPath) _loadLocalDir();
+    if (widget.leftPath != old.leftPath) { _editingPath = null; _loadLocalDir(); }
     if (widget.rightPath != old.rightPath || widget.connected != old.connected) {
+      _editingPath = null;
       if (widget.connected) _loadRemoteDir();
     }
-    if (widget.connected && !old.connected) _loadRemoteDir();
-    // Reload remote dir when tab becomes visible again (cached data may be stale)
     if (widget.connected && !old.connected) _loadRemoteDir();
   }
 
@@ -138,6 +153,7 @@ class FileBrowserWidgetState extends State<FileBrowserWidget> {
               final idx = p.lastIndexOf('/');
               _navigateLocal(idx == 0 ? '/' : p.substring(0, idx));
             },
+            onPathSubmit: (p) => _navigateLocal(p),
             onTransfer: (name) => _startTransfer(_join(widget.leftPath, name), name, true),
             l10n: l10n,
             sessionHandle: widget.sessionHandle,
@@ -163,6 +179,7 @@ class FileBrowserWidgetState extends State<FileBrowserWidget> {
               final idx = p.lastIndexOf('/');
               _navigateRemote(idx == 0 ? '/' : p.substring(0, idx));
             },
+            onPathSubmit: (p) => _navigateRemote(p),
             onTransfer: (name) => _startTransfer(_join(widget.leftPath, name), name, false),
             showPlaceholder: !widget.connected,
             l10n: l10n,
@@ -185,6 +202,7 @@ class FileBrowserWidgetState extends State<FileBrowserWidget> {
     required void Function(String) onNavigate,
     required VoidCallback onNavigateUp,
     required void Function(String) onTransfer,
+    required void Function(String) onPathSubmit,
     required AppLocalizations l10n,
     required int sessionHandle,
     required ConnectionService connectionService,
@@ -192,6 +210,7 @@ class FileBrowserWidgetState extends State<FileBrowserWidget> {
     bool showPlaceholder = false,
     String? errorMsg,
   }) {
+    final isEditing = _editingPath == path;
     return Column(
       children: [
         Container(
@@ -201,9 +220,44 @@ class FileBrowserWidgetState extends State<FileBrowserWidget> {
             children: [
               IconButton(icon: const Icon(Icons.arrow_upward, size: 18),
                   tooltip: l10n.parentDir, onPressed: onNavigateUp),
-              Expanded(child: Text(path,
-                  style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
-                  overflow: TextOverflow.ellipsis)),
+              Expanded(
+                child: isEditing
+                    ? SizedBox(
+                        height: 28,
+                        child: TextField(
+                          controller: _pathCtrl..text = path,
+                          focusNode: _pathFocus,
+                          style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+                          decoration: const InputDecoration(
+                            isDense: true,
+                            contentPadding: EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                            border: OutlineInputBorder(),
+                          ),
+                          textInputAction: TextInputAction.go,
+                          onSubmitted: (val) {
+                            final trimmed = val.trim();
+                            setState(() => _editingPath = null);
+                            if (trimmed.isNotEmpty && trimmed != path) {
+                              onPathSubmit(trimmed);
+                            }
+                          },
+                        ),
+                      )
+                    : GestureDetector(
+                        onTap: () {
+                          setState(() {
+                            _editingPath = path;
+                            _pathCtrl.text = path;
+                          });
+                          WidgetsBinding.instance.addPostFrameCallback((_) {
+                            _pathFocus.requestFocus();
+                          });
+                        },
+                        child: Text(path,
+                            style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+                            overflow: TextOverflow.ellipsis),
+                      ),
+              ),
               if (isLoading)
                 const SizedBox(width: 14, height: 14,
                     child: CircularProgressIndicator(strokeWidth: 2)),
