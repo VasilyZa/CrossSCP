@@ -7,7 +7,23 @@
 #include <libssh2_sftp.h>
 #include <cstring>
 #include <cstdlib>
+
+#ifdef _WIN32
+#define strdup _strdup
+#ifndef S_IRUSR
+#define S_IRUSR 0000400
+#define S_IWUSR 0000200
+#define S_IXUSR 0000100
+#define S_IRGRP 0000040
+#define S_IWGRP 0000020
+#define S_IXGRP 0000010
+#define S_IROTH 0000004
+#define S_IWOTH 0000002
+#define S_IXOTH 0000001
+#endif
+#else
 #include <sys/stat.h>
+#endif
 
 namespace scp {
 
@@ -36,16 +52,16 @@ scp_file_info_t* SftpSession::ParseAttrsToFileInfo(
   // Build human-readable longname (simulating ls -l)
   char perms[16];
   snprintf(perms, sizeof(perms), "%c%c%c%c%c%c%c%c%c%c",
-           is_dir ? 'd' : '-',
-           (permissions & S_IRUSR) ? 'r' : '-',
-           (permissions & S_IWUSR) ? 'w' : '-',
-           (permissions & S_IXUSR) ? 'x' : '-',
-           (permissions & S_IRGRP) ? 'r' : '-',
-           (permissions & S_IWGRP) ? 'w' : '-',
-           (permissions & S_IXGRP) ? 'x' : '-',
-           (permissions & S_IROTH) ? 'r' : '-',
-           (permissions & S_IWOTH) ? 'w' : '-',
-           (permissions & S_IXOTH) ? 'x' : '-');
+           (char)(is_dir ? 'd' : '-'),
+           (char)((permissions & S_IRUSR) ? 'r' : '-'),
+           (char)((permissions & S_IWUSR) ? 'w' : '-'),
+           (char)((permissions & S_IXUSR) ? 'x' : '-'),
+           (char)((permissions & S_IRGRP) ? 'r' : '-'),
+           (char)((permissions & S_IWGRP) ? 'w' : '-'),
+           (char)((permissions & S_IXGRP) ? 'x' : '-'),
+           (char)((permissions & S_IROTH) ? 'r' : '-'),
+           (char)((permissions & S_IWOTH) ? 'w' : '-'),
+           (char)((permissions & S_IXOTH) ? 'x' : '-'));
 
   char timebuf[32];
   time_t t = static_cast<time_t>(mtime);
