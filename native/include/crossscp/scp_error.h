@@ -62,9 +62,6 @@ typedef enum {
   SCP_ERROR_STATE_MACHINE   = -1604, // invalid state transition
 } scp_error_t;
 
-// Returns a human-readable error message for the given error code.
-const char* scp_error_string(scp_error_t error);
-
 #ifdef __cplusplus
 }
 #endif
