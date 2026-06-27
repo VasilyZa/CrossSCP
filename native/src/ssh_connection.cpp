@@ -21,6 +21,7 @@ using socklen_t = int;
 #include <sys/socket.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
 #define SET_NONBLOCK(fd) do { int flags = fcntl(fd, F_GETFL, 0); fcntl(fd, F_SETFL, flags | O_NONBLOCK); } while(0)
@@ -92,9 +93,30 @@ scp_error_t SshConnection::CreateSocket(const char* host, uint16_t port,
   UniqueResource<struct addrinfo*, decltype(free_addrinfo)> guard(result, free_addrinfo);
 
   // Try each address
-  for (struct addrinfo* rp = result; rp; rp = rp->ai_next) {
+  int addr_idx = 0;
+  for (struct addrinfo* rp = result; rp; rp = rp->ai_next, addr_idx++) {
+    char ipstr[INET6_ADDRSTRLEN];
+    void* addr = nullptr;
+    if (rp->ai_family == AF_INET) {
+      addr = &reinterpret_cast<struct sockaddr_in*>(rp->ai_addr)->sin_addr;
+    } else if (rp->ai_family == AF_INET6) {
+      addr = &reinterpret_cast<struct sockaddr_in6*>(rp->ai_addr)->sin6_addr;
+    }
+    if (addr) inet_ntop(rp->ai_family, addr, ipstr, sizeof(ipstr));
+    else snprintf(ipstr, sizeof(ipstr), "(unknown family %d)", rp->ai_family);
+
     socket_.fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-    if (!socket_.IsValid()) continue;
+    if (!socket_.IsValid()) {
+      SCP_LOG_DEBUG("[%s]:%u  addr#%d %s: socket() failed (errno=%d)",
+                    host, port, addr_idx, ipstr,
+#ifdef _WIN32
+                    WSAGetLastError()
+#else
+                    errno
+#endif
+                    );
+      continue;
+    }
 
     // Set non-blocking for connect with timeout
     if (timeout_s > 0) {
@@ -116,6 +138,8 @@ scp_error_t SshConnection::CreateSocket(const char* host, uint16_t port,
         tv.tv_usec = 0;
         ret = select(0, nullptr, &wset, nullptr, &tv);
         if (ret <= 0) {
+          SCP_LOG_DEBUG("[%s]:%u  addr#%d %s: connect timeout after %us",
+                        host, port, addr_idx, ipstr, timeout_s);
           close(socket_.fd);
           socket_.fd = INVALID_SOCKET_VALUE;
           continue;
@@ -126,16 +150,47 @@ scp_error_t SshConnection::CreateSocket(const char* host, uint16_t port,
         getsockopt(socket_.fd, SOL_SOCKET, SO_ERROR,
                    reinterpret_cast<char*>(&so_error), &len);
         if (so_error != 0) {
+          SCP_LOG_DEBUG("[%s]:%u  addr#%d %s: connect error (errno=%d: %s)",
+                        host, port, addr_idx, ipstr, so_error,
+                        strerror(so_error));
           close(socket_.fd);
           socket_.fd = INVALID_SOCKET_VALUE;
           continue;
         }
       } else {
+        SCP_LOG_DEBUG("[%s]:%u  addr#%d %s: connect immediate error (errno=%d: %s)",
+                      host, port, addr_idx, ipstr,
+#ifdef _WIN32
+                      WSAGetLastError()
+#else
+                      errno
+#endif
+                      ,
+#ifdef _WIN32
+                      ""
+#else
+                      strerror(errno)
+#endif
+                      );
         close(socket_.fd);
         socket_.fd = INVALID_SOCKET_VALUE;
         continue;
       }
     } else if (ret < 0) {
+      SCP_LOG_DEBUG("[%s]:%u  addr#%d %s: connect failed (errno=%d: %s)",
+                    host, port, addr_idx, ipstr,
+#ifdef _WIN32
+                    WSAGetLastError()
+#else
+                    errno
+#endif
+                    ,
+#ifdef _WIN32
+                    ""
+#else
+                    strerror(errno)
+#endif
+                    );
       close(socket_.fd);
       socket_.fd = INVALID_SOCKET_VALUE;
       continue;
@@ -152,7 +207,9 @@ scp_error_t SshConnection::CreateSocket(const char* host, uint16_t port,
     return SCP_OK;
   }
 
-  SetLastError("Failed to connect to host");
+  char errbuf[256];
+  snprintf(errbuf, sizeof(errbuf), "Failed to connect to %s:%u", host, port);
+  SetLastError(errbuf);
   return SCP_ERROR_CONNECT;
 }
 
