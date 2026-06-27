@@ -12,6 +12,9 @@ on:
         type: string
         default: ''
 
+permissions:
+  contents: write
+
 jobs:
   linux:
     runs-on: ubuntu-24.04
