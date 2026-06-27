@@ -471,6 +471,8 @@ scp_error_t SftpTransfer::DoDownload() {
     SCP_LOG_ERROR("Failed to open local file for download: %s", local_path);
     return SCP_ERROR_FILE_OPEN;
   }
+  // Use large stdio buffer to reduce fwrite() syscall frequency
+  setvbuf(local_file, nullptr, _IOFBF, 1024 * 1024);
 
   LIBSSH2_SFTP_HANDLE* remote_handle = libssh2_sftp_open(
       sftp, remote_path, LIBSSH2_FXF_READ, 0);
