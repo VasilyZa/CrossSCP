@@ -1,5 +1,4 @@
-/// Dual-pane file browser: local (left) + remote (right).
-
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:crossscp/l10n/app_localizations.dart';
@@ -35,12 +34,14 @@ class FileBrowserWidget extends StatefulWidget {
 
 class FileBrowserWidgetState extends State<FileBrowserWidget> {
   List<FileSystemEntity> _localEntries = [];
+  Map<String, int> _elevatedSizes = {};
   List<FileEntry> _remoteEntries = [];
   final Set<String> _selectedLocal = {};
   final Set<String> _selectedRemote = {};
   bool _loadingLocal = false;
   bool _loadingRemote = false;
   String? _remoteError;
+  String? _localError;
 
   String? _editingPath;
   final _pathCtrl = TextEditingController();
@@ -85,7 +86,7 @@ class FileBrowserWidgetState extends State<FileBrowserWidget> {
   }
 
   Future<void> _loadLocalDir() async {
-    setState(() { _loadingLocal = true; _selectedLocal.clear(); });
+    setState(() { _loadingLocal = true; _selectedLocal.clear(); _localError = null; });
     try {
       final dir = Directory(widget.leftPath);
       if (!await dir.exists()) { setState(() => _loadingLocal = false); return; }
@@ -96,8 +97,87 @@ class FileBrowserWidgetState extends State<FileBrowserWidget> {
         if (!aIsDir && bIsDir) return 1;
         return a.path.compareTo(b.path);
       });
+    } on FileSystemException catch (e) {
+      final code = e.osError?.errorCode ?? 0;
+      if (code == 13 || code == 1) {  // EACCES or EPERM
+        _localError = '权限不足';
+      } else {
+        _localError = e.message;
+      }
+      _localEntries = [];
     } catch (e) {
-      debugPrint('Error listing local dir: $e');
+      _localError = e.toString();
+      _localEntries = [];
+    }
+    setState(() => _loadingLocal = false);
+  }
+
+  Future<void> _elevateLocalDir() async {
+    setState(() { _loadingLocal = true; _localError = null; });
+    try {
+      final script = '''
+import os, json, stat, sys
+try:
+    p = sys.argv[1]
+    entries = []
+    for name in os.listdir(p):
+        full = os.path.join(p, name)
+        s = os.lstat(full)
+        entries.append(dict(name=name, isDir=stat.S_ISDIR(s.st_mode), size=s.st_size))
+    print(json.dumps(entries))
+except Exception as e:
+    print(json.dumps(dict(error=str(e))))
+''';
+      final result = await Process.run(
+          'pkexec', ['python3', '-c', script, widget.leftPath],
+          runInShell: false);
+      if (result.exitCode == 126 || result.exitCode == 127) {
+        // pkexec dismissed or cancelled
+        _localError = '认证已取消';
+        _loadingLocal = false;
+        setState(() {});
+        return;
+      }
+      final stdout = (result.stdout as String).trim();
+      if (stdout.isEmpty) {
+        _localError = 'elevation 无输出';
+        _loadingLocal = false;
+        setState(() {});
+        return;
+      }
+      try {
+        final decoded = jsonDecode(stdout);
+        if (decoded is Map && decoded.containsKey('error')) {
+          _localError = decoded['error'] as String;
+          _loadingLocal = false;
+          setState(() {});
+          return;
+        }
+        if (decoded is List) {
+          _elevatedSizes = {};
+          _localEntries = decoded.map<FileSystemEntity>((j) {
+            final name = j['name'] as String;
+            final isDir = j['isDir'] as bool;
+            final size = (j['size'] as int?) ?? 0;
+            final full = '${widget.leftPath}/$name';
+            if (!isDir) _elevatedSizes[full] = size;
+            return isDir
+                ? Directory(full)
+                : File(full);
+          }).toList();
+          _localEntries.sort((a, b) {
+            final aIsDir = a is Directory, bIsDir = b is Directory;
+            if (aIsDir && !bIsDir) return -1;
+            if (!aIsDir && bIsDir) return 1;
+            return a.path.compareTo(b.path);
+          });
+          _localError = null;
+        }
+      } catch (e) {
+        _localError = '解析 elevated 输出失败: $e';
+      }
+    } catch (e) {
+      _localError = 'pkexec 失败: $e';
     }
     setState(() => _loadingLocal = false);
   }
@@ -142,10 +222,12 @@ class FileBrowserWidgetState extends State<FileBrowserWidget> {
             isLoading: _loadingLocal,
             entries: _localEntries.map((e) {
               final name = e.path.split('/').last;
-              return _PaneEntry(name: name, isDir: e is Directory,
-                  size: e is File ? e.lengthSync() : 0);
+              final size = _elevatedSizes[e.path] ?? (e is File ? e.lengthSync() : 0);
+              return _PaneEntry(name: name, isDir: e is Directory, size: size);
             }).toList(),
             isLocal: true,
+            errorMsg: _localError,
+            onElevate: _elevateLocalDir,
             onNavigate: (dir) => _navigateLocal(_join(widget.leftPath, dir)),
             onNavigateUp: () {
               final p = widget.leftPath;
@@ -209,6 +291,7 @@ class FileBrowserWidgetState extends State<FileBrowserWidget> {
     required VoidCallback onFileOp,
     bool showPlaceholder = false,
     String? errorMsg,
+    VoidCallback? onElevate,
   }) {
     final isEditing = _editingPath == path;
     return Column(
@@ -291,7 +374,19 @@ class FileBrowserWidgetState extends State<FileBrowserWidget> {
                   Text(l10n.notConnected, style: TextStyle(color: Colors.grey.shade500)),
                 ]))
               : errorMsg != null
-              ? Center(child: Text(errorMsg!, style: TextStyle(color: Colors.red.shade400, fontSize: 12)))
+              ? Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(Icons.lock, size: 32, color: Colors.orange.shade400),
+                  const SizedBox(height: 8),
+                  Text(errorMsg!, style: TextStyle(color: Colors.orange.shade400, fontSize: 12)),
+                  if (onElevate != null) ...[
+                    const SizedBox(height: 8),
+                    FilledButton.icon(
+                      icon: const Icon(Icons.admin_panel_settings, size: 16),
+                      label: const Text('提权访问', style: TextStyle(fontSize: 12)),
+                      onPressed: onElevate,
+                    ),
+                  ],
+                ]))
               : ListView.builder(
                   itemCount: entries.length,
                   itemBuilder: (context, index) {
