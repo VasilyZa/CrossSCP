@@ -7,6 +7,10 @@ on:
         description: '上传到 GitHub Release'
         type: boolean
         default: false
+      release_note:
+        description: 'Release 说明 (Markdown)'
+        type: string
+        default: ''
 
 jobs:
   linux:
@@ -116,8 +120,9 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: CrossSCP v${{ steps.version.outputs.version }}
+          body: ${{ inputs.release_note }}
           files: |
             CrossSCP-linux-x64/CrossSCP-linux-x64.tar.gz
             CrossSCP-windows-x64/CrossSCP-windows-x64.zip
           draft: false
-          generate_release_notes: true
+          generate_release_notes: false
