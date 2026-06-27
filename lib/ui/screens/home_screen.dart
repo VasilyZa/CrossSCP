@@ -70,10 +70,13 @@ class _HomeScreenState extends State<HomeScreen> {
     else if (host.startsWith('ssh://')) host = host.substring(6);
     final fixed = SiteConfig(id: site.id, name: site.name, host: host, port: site.port,
         username: site.username, password: site.password, keyPath: site.keyPath, group: site.group);
+    debugPrint('[CrossSCP] Connecting to ${fixed.username}@${fixed.host}:${fixed.port}...');
     try {
       final h = await widget.connectionService.connect(fixed);
+      debugPrint('[CrossSCP] Connected, session=$h');
       setState(() { _connectedSessionHandle = h; _rightPath = '/'; });
-    } catch (e) {
+    } catch (e, st) {
+      debugPrint('[CrossSCP] Connect failed: $e\n$st');
       if (mounted) displayInfoBar(context, builder: (_, close) =>
           InfoBar(title: Text('连接失败: $e'), severity: InfoBarSeverity.error));
     }

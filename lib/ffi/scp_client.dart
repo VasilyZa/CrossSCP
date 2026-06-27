@@ -14,8 +14,13 @@ import 'package:crossscp/ffi/scp_error.dart';
 
 void _worker(SendPort mainPort) {
   final recv = ReceivePort();
-  mainPort.send(recv.sendPort);
-  bind.scpInit();
+  try {
+    bind.scpInit();
+    mainPort.send(recv.sendPort);  // only send after init succeeds
+  } catch (e) {
+    mainPort.send([-1, 0, 'scpInit failed: $e']);
+    return;
+  }
 
   recv.listen((msg) {
     if (msg is! List) return;
@@ -193,20 +198,43 @@ class ScpClient {
   final _pending = <int, Completer<List>>{};
   int _seq = 0;
   bool _ready = false;
+  String? _initError;
 
   Future<void> ensureReady() async {
     if (_ready) return;
     final rp = ReceivePort();
     rp.listen((msg) {
       if (msg is List && msg.length >= 2) {
-        _pending.remove(msg[0] as int)?.complete(msg);
+        final id = msg[0] as int;
+        if (id == -1) {
+          // Worker reported a fatal init error
+          _initError = '${msg[2]}';
+          _port = null;
+          return;
+        }
+        _pending.remove(id)?.complete(msg);
       } else if (msg is SendPort) {
         _port = msg;
       }
     });
     _isolate = await Isolate.spawn(_worker, rp.sendPort);
-    // Wait for worker's SendPort
-    while (_port == null) await Future.delayed(const Duration(milliseconds: 10));
+    // Wait for worker's SendPort with a timeout
+    final sw = Stopwatch()..start();
+    while (_port == null && _initError == null) {
+      if (sw.elapsedMilliseconds > 5000) {
+        rp.close();
+        _isolate?.kill(priority: Isolate.immediate);
+        _isolate = null;
+        throw Exception(_initError ?? 'Isolate startup timed out (5s)');
+      }
+      await Future.delayed(const Duration(milliseconds: 10));
+    }
+    if (_initError != null) {
+      rp.close();
+      _isolate?.kill(priority: Isolate.immediate);
+      _isolate = null;
+      throw Exception(_initError);
+    }
     _ready = true;
   }
 
