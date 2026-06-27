@@ -541,43 +541,42 @@ scp_error_t SftpTransfer::DoDownload() {
       ReportProgress(bytes_received, total_size);
     }
 
-    // ---- PHASE 2: issue new reads on idle workers ----
-    bool any_issued = false;
+    // ---- PHASE 2: try to read on each non-done worker ----
+    bool any_waiting = false;
     for (auto& wk : w) {
-      if (wk.eof || wk.pending >= 0 || !wk.h) continue;
-      size_t n = static_cast<size_t>(std::min<uint64_t>(wk.buf.size(), wk.end - wk.pos));
+      if (wk.eof || !wk.h || wk.pos >= wk.end) continue;
+      if (wk.pending >= 0) continue;  // already has data to flush
+
+      size_t n = static_cast<size_t>(
+          std::min<uint64_t>(wk.buf.size(), wk.end - wk.pos));
       ssize_t rc = libssh2_sftp_read(wk.h, wk.buf.data(), n);
       if (rc > 0) {
         wk.pending = rc;
-        any_issued = true;
       } else if (rc == LIBSSH2_ERROR_EAGAIN) {
-        // not ready yet — fine, try again after poll
+        any_waiting = true;
       } else if (rc < 0) {
-        wk.eof = true;  // error, mark done
+        wk.eof = true;
       } else {
         wk.pending = 0;  // rc == 0 -> EOF
       }
     }
 
-    // ---- PHASE 3: if nothing is in-flight, poll the socket ----
+    // ---- PHASE 3: pump libssh2 transport and poll socket ----
     bool any_active = false;
-    for (auto& wk : w) { if (!wk.eof && wk.h) { any_active = true; break; } }
+    for (auto& wk : w) { if (!wk.eof && wk.h && wk.pos < wk.end) { any_active = true; break; } }
     if (!any_active) break;
 
-    bool all_idle = true;
-    for (auto& wk : w) {
-      if (!wk.eof && wk.pending < 0 && wk.h) { /* worker is idle */ }
-      else if (wk.pending < 0 && wk.eof) { /* done */ }
-      else { all_idle = false; break; }
-    }
-
-    if (!any_issued && all_idle) {
-      // Nothing to do — wait for socket data
+    if (any_waiting) {
+      int dirs = libssh2_session_block_directions(session);
       struct pollfd pfd;
       pfd.fd     = conn_->GetSocketFd();
-      pfd.events = POLLIN;
-      int pret = poll(&pfd, 1, 200);
-      if (pret < 0 && errno != EINTR) break;
+      pfd.events = 0;
+      if (dirs & LIBSSH2_SESSION_BLOCK_INBOUND)  pfd.events |= POLLIN;
+      if (dirs & LIBSSH2_SESSION_BLOCK_OUTBOUND) pfd.events |= POLLOUT;
+      if (pfd.events) {
+        int pret = poll(&pfd, 1, 100);
+        if (pret < 0 && errno != EINTR) break;
+      }
     }
   }
 
