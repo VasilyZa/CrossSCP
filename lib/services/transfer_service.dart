@@ -62,7 +62,8 @@ class TransferService extends ChangeNotifier {
       final p = await _client.getProgress(task.transferHandle!);
       task.bytesTransferred = p[0];
       task.bytesTotal = p[1];
-      if (p[1] > 0 && p[0] >= p[1] || p[1] == 0 && p[0] == 0) {
+      // Only complete when total > 0 (native has stat'd the file) AND transferred >= total.
+      if (p[1] > 0 && p[0] >= p[1]) {
         task.status = 'completed';
         task.completedAt = DateTime.now();
         _active.remove(task.id);
@@ -95,7 +96,7 @@ class TransferService extends ChangeNotifier {
           task.bytesTotal = total;
           if (dt > 0) task.speedBps = (transferred / dt).roundToDouble();
           changed = true;
-          if (total > 0 && transferred >= total || total == 0 && transferred == 0) {
+          if (total > 0 && transferred >= total) {
             task.status = 'completed';
             task.completedAt = DateTime.now();
             _active.remove(task.id);
