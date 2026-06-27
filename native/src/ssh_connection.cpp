@@ -22,6 +22,7 @@ using socklen_t = int;
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #define SET_NONBLOCK(fd) do { int flags = fcntl(fd, F_GETFL, 0); fcntl(fd, F_SETFL, flags | O_NONBLOCK); } while(0)
@@ -130,16 +131,37 @@ scp_error_t SshConnection::CreateSocket(const char* host, uint16_t port,
 #else
       if (errno == EINPROGRESS) {
 #endif
+#ifdef _WIN32
         fd_set wset;
         FD_ZERO(&wset);
         FD_SET(socket_.fd, &wset);
         struct timeval tv;
         tv.tv_sec = timeout_s;
         tv.tv_usec = 0;
-        ret = select(socket_.fd + 1, nullptr, &wset, nullptr, &tv);
+        ret = ::select(0, nullptr, &wset, nullptr, &tv);
+#else
+        struct pollfd pfd;
+        pfd.fd = socket_.fd;
+        pfd.events = POLLOUT;
+        ret = poll(&pfd, 1, timeout_s * 1000);
+#endif
         if (ret <= 0) {
-          SCP_LOG_WARN("[%s]:%u  addr#%d %s: connect timeout after %us",
-                       host, port, addr_idx, ipstr, timeout_s);
+          SCP_LOG_WARN("[%s]:%u  addr#%d %s: connect %s (ret=%d, errno=%d: %s)",
+                       host, port, addr_idx, ipstr,
+                       (ret == 0) ? "timeout" : "error",
+                       ret,
+#ifdef _WIN32
+                       WSAGetLastError()
+#else
+                       errno
+#endif
+                       ,
+#ifdef _WIN32
+                       ""
+#else
+                       strerror(errno)
+#endif
+                       );
           close(socket_.fd);
           socket_.fd = INVALID_SOCKET_VALUE;
           continue;
