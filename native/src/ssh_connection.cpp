@@ -31,6 +31,7 @@ using socklen_t = int;
 
 #include <cstring>
 #include <cerrno>
+#include <chrono>
 
 #ifdef _WIN32
 #else
@@ -140,10 +141,21 @@ scp_error_t SshConnection::CreateSocket(const char* host, uint16_t port,
         tv.tv_usec = 0;
         ret = ::select(0, nullptr, &wset, nullptr, &tv);
 #else
+        // poll() with EINTR retry — Dart VM signals (GC, profiler) interrupt
+        auto start = std::chrono::steady_clock::now();
+        int remaining_ms = static_cast<int>(timeout_s * 1000);
         struct pollfd pfd;
         pfd.fd = socket_.fd;
         pfd.events = POLLOUT;
-        ret = poll(&pfd, 1, timeout_s * 1000);
+        do {
+          ret = poll(&pfd, 1, remaining_ms);
+          if (ret < 0 && errno == EINTR) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            remaining_ms = static_cast<int>(timeout_s * 1000 - elapsed);
+            if (remaining_ms <= 0) { ret = 0; break; }
+          }
+        } while (ret < 0 && errno == EINTR);
 #endif
         if (ret <= 0) {
           SCP_LOG_WARN("[%s]:%u  addr#%d %s: connect %s (ret=%d, errno=%d: %s)",
