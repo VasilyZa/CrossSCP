@@ -107,14 +107,14 @@ scp_error_t SshConnection::CreateSocket(const char* host, uint16_t port,
 
     socket_.fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
     if (!socket_.IsValid()) {
-      SCP_LOG_DEBUG("[%s]:%u  addr#%d %s: socket() failed (errno=%d)",
-                    host, port, addr_idx, ipstr,
+      SCP_LOG_WARN("[%s]:%u  addr#%d %s: socket() failed (errno=%d)",
+                   host, port, addr_idx, ipstr,
 #ifdef _WIN32
-                    WSAGetLastError()
+                   WSAGetLastError()
 #else
-                    errno
+                   errno
 #endif
-                    );
+                   );
       continue;
     }
 
@@ -138,8 +138,8 @@ scp_error_t SshConnection::CreateSocket(const char* host, uint16_t port,
         tv.tv_usec = 0;
         ret = select(0, nullptr, &wset, nullptr, &tv);
         if (ret <= 0) {
-          SCP_LOG_DEBUG("[%s]:%u  addr#%d %s: connect timeout after %us",
-                        host, port, addr_idx, ipstr, timeout_s);
+          SCP_LOG_WARN("[%s]:%u  addr#%d %s: connect timeout after %us",
+                       host, port, addr_idx, ipstr, timeout_s);
           close(socket_.fd);
           socket_.fd = INVALID_SOCKET_VALUE;
           continue;
@@ -150,47 +150,47 @@ scp_error_t SshConnection::CreateSocket(const char* host, uint16_t port,
         getsockopt(socket_.fd, SOL_SOCKET, SO_ERROR,
                    reinterpret_cast<char*>(&so_error), &len);
         if (so_error != 0) {
-          SCP_LOG_DEBUG("[%s]:%u  addr#%d %s: connect error (errno=%d: %s)",
-                        host, port, addr_idx, ipstr, so_error,
-                        strerror(so_error));
+          SCP_LOG_WARN("[%s]:%u  addr#%d %s: connect error (errno=%d: %s)",
+                       host, port, addr_idx, ipstr, so_error,
+                       strerror(so_error));
           close(socket_.fd);
           socket_.fd = INVALID_SOCKET_VALUE;
           continue;
         }
       } else {
-        SCP_LOG_DEBUG("[%s]:%u  addr#%d %s: connect immediate error (errno=%d: %s)",
-                      host, port, addr_idx, ipstr,
+        SCP_LOG_WARN("[%s]:%u  addr#%d %s: connect immediate error (errno=%d: %s)",
+                     host, port, addr_idx, ipstr,
 #ifdef _WIN32
-                      WSAGetLastError()
+                     WSAGetLastError()
 #else
-                      errno
+                     errno
 #endif
-                      ,
+                     ,
 #ifdef _WIN32
-                      ""
+                     ""
 #else
-                      strerror(errno)
+                     strerror(errno)
 #endif
-                      );
+                     );
         close(socket_.fd);
         socket_.fd = INVALID_SOCKET_VALUE;
         continue;
       }
     } else if (ret < 0) {
-      SCP_LOG_DEBUG("[%s]:%u  addr#%d %s: connect failed (errno=%d: %s)",
-                    host, port, addr_idx, ipstr,
+      SCP_LOG_WARN("[%s]:%u  addr#%d %s: connect failed (errno=%d: %s)",
+                   host, port, addr_idx, ipstr,
 #ifdef _WIN32
-                    WSAGetLastError()
+                   WSAGetLastError()
 #else
-                    errno
+                   errno
 #endif
-                    ,
+                   ,
 #ifdef _WIN32
-                    ""
+                   ""
 #else
-                    strerror(errno)
+                   strerror(errno)
 #endif
-                    );
+                   );
       close(socket_.fd);
       socket_.fd = INVALID_SOCKET_VALUE;
       continue;
