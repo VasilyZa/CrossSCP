@@ -85,6 +85,11 @@ class FileBrowserWidgetState extends State<FileBrowserWidget> {
     return '$base/$name';
   }
 
+  static int _safeFileSize(FileSystemEntity e) {
+    if (e is! File) return 0;
+    try { return e.lengthSync(); } catch (_) { return 0; }
+  }
+
   Future<void> _loadLocalDir() async {
     setState(() { _loadingLocal = true; _selectedLocal.clear(); _localError = null; });
     try {
@@ -222,7 +227,7 @@ except Exception as e:
             isLoading: _loadingLocal,
             entries: _localEntries.map((e) {
               final name = e.path.split('/').last;
-              final size = _elevatedSizes[e.path] ?? (e is File ? e.lengthSync() : 0);
+              final size = _elevatedSizes[e.path] ?? _safeFileSize(e);
               return _PaneEntry(name: name, isDir: e is Directory, size: size);
             }).toList(),
             isLocal: true,
