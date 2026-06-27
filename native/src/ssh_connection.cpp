@@ -59,9 +59,11 @@ void SshConnection::SetSocketOptions() {
     SCP_LOG_DEBUG("TCP_NODELAY set on socket %d", socket_.fd);
   }
 
-  // Set socket buffer sizes for bulk transfer
-  int sndbuf = 256 * 1024;
-  int rcvbuf = 256 * 1024;
+  // Set socket buffer sizes for high-throughput bulk transfer.
+  // Larger buffers allow the TCP window to grow and keep the pipe full on
+  // high-bandwidth / high-latency links.
+  int sndbuf = 4 * 1024 * 1024;
+  int rcvbuf = 4 * 1024 * 1024;
   setsockopt(socket_.fd, SOL_SOCKET, SO_SNDBUF,
              reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
   setsockopt(socket_.fd, SOL_SOCKET, SO_RCVBUF,

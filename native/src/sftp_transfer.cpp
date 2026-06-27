@@ -9,7 +9,10 @@
 #include <cstdio>
 #include <cstring>
 #include <cerrno>
+#include <cinttypes>
 #include <algorithm>
+#include <deque>
+#include <vector>
 
 #ifdef _WIN32
 #include <io.h>
@@ -21,12 +24,15 @@
 
 namespace scp {
 
-// Defaults
+// Defaults — tuned for high-throughput bulk transfer.
 static constexpr uint32_t kDefaultMaxConcurrent = 32;
-static constexpr uint32_t kDefaultBlockSize      = 256 * 1024;  // 256KB
+static constexpr uint32_t kDefaultBlockSize      = 2 * 1024 * 1024;   // 2 MB
 static constexpr uint32_t kDefaultProgressThrottleMs = 100;
-static constexpr uint32_t kMinBlockSize          = 4 * 1024;    // 4KB min
-static constexpr uint32_t kMaxBlockSize          = 8 * 1024 * 1024;  // 8MB max
+static constexpr uint32_t kMinBlockSize          = 4 * 1024;          // 4 KB
+static constexpr uint32_t kMaxBlockSize          = 16 * 1024 * 1024; // 16 MB
+
+// Number of read-ahead blocks in the pipeline.
+static constexpr int kPipelineBlocks = 3;
 
 static uint32_t ClampUint32(uint32_t val, uint32_t min_val, uint32_t max_val) {
   if (val == 0) return min_val;
@@ -35,12 +41,61 @@ static uint32_t ClampUint32(uint32_t val, uint32_t min_val, uint32_t max_val) {
   return val;
 }
 
+// ---------------------------------------------------------------------------
+//  Pipeline helper for upload: a dedicated thread reads from local file
+//  while the main transfer thread writes to the SFTP channel.
+// ---------------------------------------------------------------------------
+struct UploadPipeline {
+  std::vector<std::vector<char>> buffers;
+  std::deque<size_t> ready;       // indices: blocks ready for SFTP write
+  std::deque<size_t> free_slots;  // indices: blocks the reader may fill
+  std::mutex mtx;
+  std::condition_variable cv;
+  bool reader_eof{false};
+  scp_error_t reader_err{SCP_OK};
+
+  explicit UploadPipeline(size_t block_size) {
+    buffers.resize(kPipelineBlocks);
+    for (size_t i = 0; i < kPipelineBlocks; ++i) {
+      buffers[i].resize(block_size);
+      free_slots.push_back(i);
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------
+//  Pipeline helper for download: a dedicated thread writes to local file
+//  while the main transfer thread reads from the SFTP channel.
+// ---------------------------------------------------------------------------
+struct DownloadPipeline {
+  struct Block {
+    size_t idx;
+    size_t bytes;
+  };
+  std::vector<std::vector<char>> buffers;
+  std::deque<Block> ready;       // blocks received from SFTP, pending local write
+  std::deque<size_t> free_slots; // empty blocks available for SFTP read
+  std::mutex mtx;
+  std::condition_variable cv;
+  bool writer_done{false};
+  scp_error_t writer_err{SCP_OK};
+
+  explicit DownloadPipeline(size_t block_size) {
+    buffers.resize(kPipelineBlocks);
+    for (size_t i = 0; i < kPipelineBlocks; ++i) {
+      buffers[i].resize(block_size);
+      free_slots.push_back(i);
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------
+
 SftpTransfer::SftpTransfer(SshConnection* conn,
                            const scp_transfer_config_t* config)
     : conn_(conn) {
   memcpy(&config_, config, sizeof(scp_transfer_config_t));
 
-  // Copy path strings so caller can free their copies immediately
   if (config_.local_path) {
     local_path_ = config_.local_path;
     config_.local_path = local_path_.c_str();
@@ -50,13 +105,12 @@ SftpTransfer::SftpTransfer(SshConnection* conn,
     config_.remote_path = remote_path_.c_str();
   }
 
-  // Clamp to reasonable values
   config_.max_concurrent = ClampUint32(config->max_concurrent, 1,
-                                        kDefaultMaxConcurrent * 4);
+                                       kDefaultMaxConcurrent * 4);
   config_.block_size = ClampUint32(config->block_size, kMinBlockSize,
-                                    kMaxBlockSize);
+                                   kMaxBlockSize);
   config_.progress_throttle_ms = ClampUint32(config->progress_throttle_ms,
-                                              10, 5000);
+                                             10, 5000);
 
   if (config_.max_concurrent == 0) config_.max_concurrent = kDefaultMaxConcurrent;
   if (config_.block_size == 0) config_.block_size = kDefaultBlockSize;
@@ -79,7 +133,7 @@ scp_error_t SftpTransfer::Start() {
   }
 
   transfer_thread_ = std::make_unique<std::thread>(&SftpTransfer::TransferThread,
-                                                    this);
+                                                   this);
   return SCP_OK;
 }
 
@@ -114,7 +168,7 @@ scp_error_t SftpTransfer::Cancel() {
   if (current == TransferState::kCancelled ||
       current == TransferState::kCompleted ||
       current == TransferState::kError) {
-    return SCP_OK;  // Already in terminal state
+    return SCP_OK;
   }
   state_.store(TransferState::kCancelled, std::memory_order_release);
   {
@@ -158,15 +212,12 @@ void SftpTransfer::TransferThread() {
   }
 }
 
-// Check if we should pause or cancel
 static bool ShouldStop(const SftpTransfer* self, TransferState* out_current) {
   TransferState s = self->GetState();
   if (out_current) *out_current = s;
-  return s == TransferState::kPaused ||
-         s == TransferState::kCancelled;
+  return s == TransferState::kPaused || s == TransferState::kCancelled;
 }
 
-// Wait while paused
 static void WaitWhilePaused(std::mutex& mtx,
                              std::condition_variable& cv,
                              bool& flag,
@@ -177,6 +228,17 @@ static void WaitWhilePaused(std::mutex& mtx,
   }
 }
 
+// Helper: check whether a transfer was cancelled or paused from inside
+// a pipeline helper thread (which must not pause — just bail out).
+static bool TransferCancelled(const SftpTransfer* self) {
+  TransferState s = self->GetState();
+  return s == TransferState::kCancelled;
+}
+
+// =========================================================================
+//  Upload with read-ahead pipeline
+// =========================================================================
+
 scp_error_t SftpTransfer::DoUpload() {
   LIBSSH2_SFTP* sftp = conn_->GetSftpSession();
   if (!sftp) return SCP_ERROR_SFTP;
@@ -184,20 +246,18 @@ scp_error_t SftpTransfer::DoUpload() {
   const char* local_path  = config_.local_path;
   const char* remote_path = config_.remote_path;
 
-  // Open local file for reading
   FILE* local_file = fopen(local_path, "rb");
   if (!local_file) {
     SCP_LOG_ERROR("Failed to open local file for upload: %s", local_path);
     return SCP_ERROR_FILE_OPEN;
   }
 
-  // Get local file size
   fseeko(local_file, 0, SEEK_END);
   uint64_t total_size = ftello(local_file);
   fseeko(local_file, 0, SEEK_SET);
   bytes_total_.store(total_size, std::memory_order_release);
 
-  // Handle resume: if resume is enabled, check remote file size
+  // Resume support
   uint64_t resume_offset = 0;
   int open_flags = LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC;
   if (config_.resume) {
@@ -205,16 +265,13 @@ scp_error_t SftpTransfer::DoUpload() {
     int ret = libssh2_sftp_stat(sftp, remote_path, &attrs);
     if (ret == 0 && attrs.filesize < total_size) {
       resume_offset = attrs.filesize;
-      // Open in append mode (no truncation)
       open_flags = LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT;
-      fseeko(local_file, resume_offset, SEEK_SET);
       SCP_LOG_INFO("Resuming upload from offset %llu/%llu",
                    (unsigned long long)resume_offset,
                    (unsigned long long)total_size);
     }
   }
 
-  // Open remote file
   LIBSSH2_SFTP_HANDLE* remote_handle = libssh2_sftp_open(
       sftp, remote_path, open_flags,
       LIBSSH2_SFTP_S_IRUSR | LIBSSH2_SFTP_S_IWUSR |
@@ -225,87 +282,150 @@ scp_error_t SftpTransfer::DoUpload() {
     return SCP_ERROR_FILE_OPEN;
   }
 
-  // Allocate block buffer
-  ScopedBuffer<char> block(config_.block_size);
-  if (!block) {
-    libssh2_sftp_close(remote_handle);
-    fclose(local_file);
-    return SCP_ERROR_MEMORY;
-  }
-
+  // Pipeline: reader thread reads ahead from disk, main thread writes to SFTP.
+  UploadPipeline pipe(config_.block_size);
   uint64_t bytes_sent = resume_offset;
 
-  // Simple sequential upload with keepalive-style progress.
-  // For true async concurrent requests, we would need to use
-  // libssh2_session_block_directions() with a select loop.
-  // For simplicity and reliability, we use a streaming sequential
-  // approach with large buffers, which is sufficient for most use cases.
-  // The WinSCP-level concurrency comes from multiple parallel transfers.
+  // Reader thread: fills buffers from local file.
+  std::thread reader([&]() {
+    fseeko(local_file, static_cast<int64_t>(resume_offset), SEEK_SET);
+
+    while (!TransferCancelled(this)) {
+      size_t idx;
+      {
+        std::unique_lock<std::mutex> lock(pipe.mtx);
+        pipe.cv.wait(lock, [&]() {
+          return !pipe.free_slots.empty() || TransferCancelled(this);
+        });
+        if (TransferCancelled(this)) return;
+        idx = pipe.free_slots.front();
+        pipe.free_slots.pop_front();
+      }
+
+      size_t bytes = fread(pipe.buffers[idx].data(), 1,
+                           config_.block_size, local_file);
+      if (bytes == 0) {
+        if (ferror(local_file)) {
+          pipe.reader_err = SCP_ERROR_FILE_READ;
+        }
+        pipe.reader_eof = true;
+        {
+          std::lock_guard<std::mutex> lock(pipe.mtx);
+          pipe.ready.push_back(idx);
+        }
+        pipe.cv.notify_one();
+        return;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(pipe.mtx);
+        pipe.ready.push_back(idx);
+      }
+      pipe.cv.notify_one();
+
+      // Last block (partial read) is EOF
+      if (bytes < config_.block_size) {
+        pipe.reader_eof = true;
+        return;
+      }
+    }
+  });
+
+  scp_error_t result = SCP_OK;
+  std::deque<size_t> pending_free;  // blocks freed after write, deferred return
 
   while (bytes_sent < total_size) {
-    // Check pause / cancel
+    // Pause / cancel
     {
       TransferState st;
       if (ShouldStop(this, &st)) {
-        libssh2_sftp_close(remote_handle);
-        fclose(local_file);
-        if (st == TransferState::kCancelled) {
-          // Optionally clean up partial remote file
-          if (cleanup_on_cancel_.load(std::memory_order_acquire)) {
-            libssh2_sftp_unlink(sftp, remote_path);
-          }
-          return SCP_ERROR_CANCELLED;
-        }
-        // Paused: preserve state so caller can resume
-        // TODO: store resume_offset for external resume
-        return SCP_ERROR_PAUSED;
+        result = (st == TransferState::kCancelled) ? SCP_ERROR_CANCELLED
+                                                    : SCP_ERROR_PAUSED;
+        // Wake up reader so it can exit
+        pipe.cv.notify_all();
+        break;
       }
       WaitWhilePaused(pause_mutex_, pause_cv_, paused_flag_, this);
     }
 
-    size_t to_read = static_cast<size_t>(
-        std::min<uint64_t>(config_.block_size, total_size - bytes_sent));
-    size_t bytes_read = fread(block.get(), 1, to_read, local_file);
-    if (bytes_read == 0) {
-      if (ferror(local_file)) {
-        SCP_LOG_ERROR("Error reading local file at offset %llu",
-                      (unsigned long long)bytes_sent);
-        libssh2_sftp_close(remote_handle);
-        fclose(local_file);
-        return SCP_ERROR_FILE_READ;
+    // Return freed blocks from previous write(s) back to the reader.
+    while (!pending_free.empty()) {
+      {
+        std::lock_guard<std::mutex> lock(pipe.mtx);
+        pipe.free_slots.push_back(pending_free.front());
       }
-      break;  // EOF
+      pipe.cv.notify_one();
+      pending_free.pop_front();
     }
 
-    // Write to remote
-    ssize_t rc = libssh2_sftp_write(remote_handle, block.get(), bytes_read);
+    size_t idx;
+    {
+      std::unique_lock<std::mutex> lock(pipe.mtx);
+      // Block until there's data to write, or reader is finished/errored.
+      pipe.cv.wait(lock, [&]() {
+        return !pipe.ready.empty() || pipe.reader_eof || pipe.reader_err != SCP_OK
+               || TransferCancelled(this);
+      });
+      if (pipe.reader_err != SCP_OK) {
+        result = pipe.reader_err;
+        break;
+      }
+      if (pipe.ready.empty() && pipe.reader_eof) break;
+      if (TransferCancelled(this)) { result = SCP_ERROR_CANCELLED; break; }
+      idx = pipe.ready.front();
+      pipe.ready.pop_front();
+    }
+
+    size_t to_write = static_cast<size_t>(
+        std::min<uint64_t>(config_.block_size, total_size - bytes_sent));
+    ssize_t rc = libssh2_sftp_write(remote_handle,
+                                    pipe.buffers[idx].data(), to_write);
     if (rc < 0) {
-      SCP_LOG_ERROR("SFTP write failed at offset %llu", (unsigned long long)bytes_sent);
-      libssh2_sftp_close(remote_handle);
-      fclose(local_file);
-      return SCP_ERROR_REMOTE_IO;
+      SCP_LOG_ERROR("SFTP write failed at offset %llu",
+                    (unsigned long long)bytes_sent);
+      result = SCP_ERROR_REMOTE_IO;
+      break;
     }
 
     bytes_sent += rc;
     bytes_transferred_.store(bytes_sent, std::memory_order_release);
     ReportProgress(bytes_sent, total_size);
+
+    // Defer returning this block to avoid holding pipe.mtx during SFTP write.
+    pending_free.push_back(idx);
+
+    // If there's a pending error from the reader that we haven't processed
+    {
+      std::lock_guard<std::mutex> lock(pipe.mtx);
+      if (pipe.reader_err != SCP_OK) {
+        result = pipe.reader_err;
+        break;
+      }
+    }
   }
 
-  // Close handles
+  // Return remaining freed blocks and clean up.
+  for (size_t idx : pending_free) {
+    std::lock_guard<std::mutex> lock(pipe.mtx);
+    pipe.free_slots.push_back(idx);
+  }
+  pipe.cv.notify_all();
+  reader.join();
+
   libssh2_sftp_close(remote_handle);
   fclose(local_file);
 
-  // Optional checksum verification
-  if (config_.verify_checksum) {
-    SCP_LOG_INFO("Upload complete (%llu bytes), skipping checksum (not yet implemented)",
-                 (unsigned long long)bytes_sent);
+  if (result == SCP_OK) {
+    bytes_transferred_.store(bytes_sent, std::memory_order_release);
+    SCP_LOG_INFO("Upload complete: %s -> %s (%llu bytes)",
+                 local_path, remote_path, (unsigned long long)bytes_sent);
   }
-
-  bytes_transferred_.store(bytes_sent, std::memory_order_release);
-  SCP_LOG_INFO("Upload complete: %s -> %s (%llu bytes)",
-               local_path, remote_path, (unsigned long long)bytes_sent);
-  return SCP_OK;
+  return result;
 }
+
+// =========================================================================
+//  Download with write-behind pipeline
+// =========================================================================
 
 scp_error_t SftpTransfer::DoDownload() {
   LIBSSH2_SFTP* sftp = conn_->GetSftpSession();
@@ -314,7 +434,6 @@ scp_error_t SftpTransfer::DoDownload() {
   const char* remote_path = config_.remote_path;
   const char* local_path  = config_.local_path;
 
-  // Stat remote file to get total size
   LIBSSH2_SFTP_ATTRIBUTES attrs;
   int ret = libssh2_sftp_stat(sftp, remote_path, &attrs);
   if (ret != 0) {
@@ -324,11 +443,10 @@ scp_error_t SftpTransfer::DoDownload() {
   uint64_t total_size = attrs.filesize;
   bytes_total_.store(total_size, std::memory_order_release);
 
-  // Handle resume
+  // Resume support
   uint64_t resume_offset = 0;
   const char* open_mode = "wb";
   if (config_.resume) {
-    // Check local file size
     FILE* f = fopen(local_path, "rb");
     if (f) {
       fseeko(f, 0, SEEK_END);
@@ -344,14 +462,12 @@ scp_error_t SftpTransfer::DoDownload() {
     }
   }
 
-  // Open local file
   FILE* local_file = fopen(local_path, open_mode);
   if (!local_file) {
     SCP_LOG_ERROR("Failed to open local file for download: %s", local_path);
     return SCP_ERROR_FILE_OPEN;
   }
 
-  // Open remote file
   LIBSSH2_SFTP_HANDLE* remote_handle = libssh2_sftp_open(
       sftp, remote_path, LIBSSH2_FXF_READ, 0);
   if (!remote_handle) {
@@ -360,88 +476,144 @@ scp_error_t SftpTransfer::DoDownload() {
     return SCP_ERROR_FILE_OPEN;
   }
 
-  // Seek to resume offset if needed
   if (resume_offset > 0) {
     libssh2_sftp_seek64(remote_handle, resume_offset);
   }
 
-  // Allocate block buffer
-  ScopedBuffer<char> block(config_.block_size);
-  if (!block) {
-    libssh2_sftp_close(remote_handle);
-    fclose(local_file);
-    return SCP_ERROR_MEMORY;
-  }
-
+  // Pipeline: main thread reads from SFTP, writer thread writes to local file.
+  DownloadPipeline pipe(config_.block_size);
   uint64_t bytes_received = resume_offset;
 
+  // Writer thread: drains the ready queue and writes to local file.
+  std::thread writer([&]() {
+    while (!TransferCancelled(this)) {
+      DownloadPipeline::Block blk;
+      {
+        std::unique_lock<std::mutex> lock(pipe.mtx);
+        pipe.cv.wait(lock, [&]() {
+          return !pipe.ready.empty() || pipe.writer_done
+                 || TransferCancelled(this);
+        });
+        if (TransferCancelled(this)) return;
+        if (pipe.ready.empty() && pipe.writer_done) return;
+        blk = pipe.ready.front();
+        pipe.ready.pop_front();
+      }
+
+      size_t written = fwrite(pipe.buffers[blk.idx].data(), 1,
+                              blk.bytes, local_file);
+      if (written != blk.bytes) {
+        pipe.writer_err = (errno == ENOSPC) ? SCP_ERROR_DISK_FULL
+                                            : SCP_ERROR_FILE_WRITE;
+        pipe.writer_done = true;
+        return;
+      }
+
+      // Return block to free list
+      {
+        std::lock_guard<std::mutex> lock(pipe.mtx);
+        pipe.free_slots.push_back(blk.idx);
+      }
+      pipe.cv.notify_one();
+    }
+  });
+
+  scp_error_t result = SCP_OK;
+
   while (bytes_received < total_size) {
-    // Check pause / cancel
+    // Pause / cancel
     {
       TransferState st;
       if (ShouldStop(this, &st)) {
-        libssh2_sftp_close(remote_handle);
-        fclose(local_file);
-        if (st == TransferState::kCancelled) {
-          if (cleanup_on_cancel_.load(std::memory_order_acquire)) {
-            // Don't delete on download cancel - user may want partial file
-          }
-          return SCP_ERROR_CANCELLED;
-        }
-        return SCP_ERROR_PAUSED;
+        result = (st == TransferState::kCancelled) ? SCP_ERROR_CANCELLED
+                                                    : SCP_ERROR_PAUSED;
+        break;
       }
       WaitWhilePaused(pause_mutex_, pause_cv_, paused_flag_, this);
     }
 
+    // Check for writer errors
+    {
+      std::lock_guard<std::mutex> lock(pipe.mtx);
+      if (pipe.writer_err != SCP_OK) {
+        result = pipe.writer_err;
+        break;
+      }
+    }
+
+    // Get a free buffer slot
+    size_t idx;
+    {
+      std::unique_lock<std::mutex> lock(pipe.mtx);
+      pipe.cv.wait(lock, [&]() {
+        return !pipe.free_slots.empty() || pipe.writer_err != SCP_OK
+               || TransferCancelled(this);
+      });
+      if (pipe.writer_err != SCP_OK) { result = pipe.writer_err; break; }
+      if (TransferCancelled(this)) { result = SCP_ERROR_CANCELLED; break; }
+      idx = pipe.free_slots.front();
+      pipe.free_slots.pop_front();
+    }
+
     size_t to_read = static_cast<size_t>(
         std::min<uint64_t>(config_.block_size, total_size - bytes_received));
-    ssize_t rc = libssh2_sftp_read(remote_handle, block.get(), to_read);
+    ssize_t rc = libssh2_sftp_read(remote_handle,
+                                   pipe.buffers[idx].data(), to_read);
     if (rc < 0) {
       SCP_LOG_ERROR("SFTP read failed at offset %llu",
                     (unsigned long long)bytes_received);
-      libssh2_sftp_close(remote_handle);
-      fclose(local_file);
-      return SCP_ERROR_REMOTE_IO;
+      result = SCP_ERROR_REMOTE_IO;
+      pipe.writer_done = true;
+      pipe.cv.notify_all();
+      break;
     }
     if (rc == 0) break;  // EOF
 
-    size_t written = fwrite(block.get(), 1, rc, local_file);
-    if (written != static_cast<size_t>(rc)) {
-      SCP_LOG_ERROR("Failed to write local file: %s (disk full?)", local_path);
-      libssh2_sftp_close(remote_handle);
-      fclose(local_file);
-      return (errno == ENOSPC) ? SCP_ERROR_DISK_FULL : SCP_ERROR_FILE_WRITE;
+    // Enqueue for the writer
+    {
+      std::lock_guard<std::mutex> lock(pipe.mtx);
+      pipe.ready.push_back({idx, static_cast<size_t>(rc)});
     }
+    pipe.cv.notify_one();
 
     bytes_received += rc;
     bytes_transferred_.store(bytes_received, std::memory_order_release);
     ReportProgress(bytes_received, total_size);
   }
 
+  // Signal writer to finish
+  {
+    std::lock_guard<std::mutex> lock(pipe.mtx);
+    pipe.writer_done = true;
+  }
+  pipe.cv.notify_all();
+  writer.join();
+
   libssh2_sftp_close(remote_handle);
   fclose(local_file);
 
-  if (config_.verify_checksum) {
-    SCP_LOG_INFO("Download complete (%llu bytes), skipping checksum (not yet implemented)",
-                 (unsigned long long)bytes_received);
+  // Check writer errors
+  if (result == SCP_OK && pipe.writer_err != SCP_OK) {
+    result = pipe.writer_err;
   }
 
-  SCP_LOG_INFO("Download complete: %s -> %s (%llu bytes)",
-               remote_path, local_path, (unsigned long long)bytes_received);
-  return SCP_OK;
+  if (result == SCP_OK) {
+    SCP_LOG_INFO("Download complete: %s -> %s (%llu bytes)",
+                 remote_path, local_path, (unsigned long long)bytes_received);
+  }
+  return result;
 }
 
 void SftpTransfer::ReportProgress(uint64_t transferred, uint64_t total) {
   if (!config_.progress_callback) return;
 
-  // Throttle: only call callback at configured interval
   auto now = std::chrono::steady_clock::now();
   {
     std::lock_guard<std::mutex> lock(progress_mutex_);
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - last_progress_time_).count();
     if (elapsed < static_cast<long long>(config_.progress_throttle_ms)) {
-      return;  // Skip this callback
+      return;
     }
     last_progress_time_ = now;
   }
