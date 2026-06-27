@@ -12,14 +12,16 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Prefer LLVM/Clang if available as CMAKE_CXX_COMPILER, but don't force.
-# The parent project (Flutter) may use a different compiler.
-if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-  find_program(CLANG_CXX clang++)
-  if(CLANG_CXX)
-    message(STATUS "Using Clang: ${CLANG_CXX}")
-    set(CMAKE_C_COMPILER   clang   CACHE STRING "" FORCE)
-    set(CMAKE_CXX_COMPILER clang++ CACHE STRING "" FORCE)
+# Prefer LLVM/Clang when building standalone. When included as a subdirectory
+# (e.g. from windows/CMakeLists.txt), the parent project controls the compiler.
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    find_program(CLANG_CXX clang++)
+    if(CLANG_CXX)
+      message(STATUS "Using Clang: ${CLANG_CXX}")
+      set(CMAKE_C_COMPILER   clang   CACHE STRING "" FORCE)
+      set(CMAKE_CXX_COMPILER clang++ CACHE STRING "" FORCE)
+    endif()
   endif()
 endif()
 
@@ -177,18 +179,20 @@ else()
 endif()
 
 # =============================================================================
-# Install
+# Install (only when building standalone; parent projects handle their own)
 # =============================================================================
 
-include(GNUInstallDirs)
-install(TARGETS scp_native
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-)
-install(FILES ${SCP_HEADERS}
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/crossscp
-)
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+  include(GNUInstallDirs)
+  install(TARGETS scp_native
+      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  )
+  install(FILES ${SCP_HEADERS}
+      DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/crossscp
+  )
+endif()
 
 # =============================================================================
 # Print summary
