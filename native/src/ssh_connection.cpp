@@ -8,8 +8,14 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <io.h>
 #define close closesocket
 using socklen_t = int;
+// Non-blocking socket I/O via ioctlsocket instead of fcntl
+#define SET_NONBLOCK(fd) do { u_long mode = 1; ioctlsocket(fd, FIONBIO, &mode); } while(0)
+#define SET_BLOCK(fd)    do { u_long mode = 0; ioctlsocket(fd, FIONBIO, &mode); } while(0)
+#define strdup _strdup
+#pragma warning(disable: 4244 4267)
 #else
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -17,6 +23,8 @@ using socklen_t = int;
 #include <netinet/tcp.h>
 #include <unistd.h>
 #include <fcntl.h>
+#define SET_NONBLOCK(fd) do { int flags = fcntl(fd, F_GETFL, 0); fcntl(fd, F_SETFL, flags | O_NONBLOCK); } while(0)
+#define SET_BLOCK(fd)    do { int flags = fcntl(fd, F_GETFL, 0); fcntl(fd, F_SETFL, flags & ~O_NONBLOCK); } while(0)
 #endif
 
 #include <cstring>
@@ -84,12 +92,11 @@ scp_error_t SshConnection::CreateSocket(const char* host, uint16_t port,
   // Try each address
   for (struct addrinfo* rp = result; rp; rp = rp->ai_next) {
     socket_.fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-    if (socket_.fd < 0) continue;
+    if (!socket_.IsValid()) continue;
 
     // Set non-blocking for connect with timeout
     if (timeout_s > 0) {
-      int flags = fcntl(socket_.fd, F_GETFL, 0);
-      fcntl(socket_.fd, F_SETFL, flags | O_NONBLOCK);
+      SET_NONBLOCK(socket_.fd);
     }
 
     ret = connect(socket_.fd, rp->ai_addr, rp->ai_addrlen);
@@ -105,10 +112,10 @@ scp_error_t SshConnection::CreateSocket(const char* host, uint16_t port,
         struct timeval tv;
         tv.tv_sec = timeout_s;
         tv.tv_usec = 0;
-        ret = select(socket_.fd + 1, nullptr, &wset, nullptr, &tv);
+        ret = select(0, nullptr, &wset, nullptr, &tv);
         if (ret <= 0) {
           close(socket_.fd);
-          socket_.fd = -1;
+          socket_.fd = INVALID_SOCKET_VALUE;
           continue;
         }
         // Check connect result
@@ -118,24 +125,23 @@ scp_error_t SshConnection::CreateSocket(const char* host, uint16_t port,
                    reinterpret_cast<char*>(&so_error), &len);
         if (so_error != 0) {
           close(socket_.fd);
-          socket_.fd = -1;
+          socket_.fd = INVALID_SOCKET_VALUE;
           continue;
         }
       } else {
         close(socket_.fd);
-        socket_.fd = -1;
+        socket_.fd = INVALID_SOCKET_VALUE;
         continue;
       }
     } else if (ret < 0) {
       close(socket_.fd);
-      socket_.fd = -1;
+      socket_.fd = INVALID_SOCKET_VALUE;
       continue;
     }
 
     // Restore blocking mode
     if (timeout_s > 0) {
-      int flags = fcntl(socket_.fd, F_GETFL, 0);
-      fcntl(socket_.fd, F_SETFL, flags & ~O_NONBLOCK);
+      SET_BLOCK(socket_.fd);
     }
 
     // Connected successfully
@@ -470,7 +476,7 @@ scp_error_t SshConnection::Disconnect() {
     shutdown(socket_.fd, SHUT_RDWR);
 #endif
     close(socket_.fd);
-    socket_.fd = -1;
+    socket_.fd = INVALID_SOCKET_VALUE;
   }
 
   host_.clear();

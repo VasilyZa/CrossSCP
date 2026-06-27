@@ -6,6 +6,9 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <cstdint>
+
+#include <cstdint>
 
 // Forward-declare libssh2 types (no need to include the heavy headers here)
 typedef struct _LIBSSH2_SESSION LIBSSH2_SESSION;
@@ -15,10 +18,18 @@ typedef struct _LIBSSH2_SFTP LIBSSH2_SFTP;
 
 namespace scp {
 
-struct SshSocket {
-  int fd = -1;
+#ifdef _WIN32
+using socket_t = intptr_t;
+#define INVALID_SOCKET_VALUE static_cast<intptr_t>(-1)
+#else
+using socket_t = int;
+#define INVALID_SOCKET_VALUE (-1)
+#endif
 
-  bool IsValid() const { return fd >= 0; }
+struct SshSocket {
+  socket_t fd = INVALID_SOCKET_VALUE;
+
+  bool IsValid() const { return fd != INVALID_SOCKET_VALUE; }
 };
 
 // Encapsulates a single SSH connection: socket + libssh2 session + SFTP session.
@@ -44,7 +55,7 @@ class SshConnection {
   LIBSSH2_SFTP*    GetSftpSession() const { return sftp_session_; }
   const std::string& GetHost() const { return host_; }
   const std::string& GetLastError() const { return last_error_; }
-  int64_t GetSocketFd() const { return socket_.fd; }
+  intptr_t GetSocketFd() const { return socket_.fd; }
 
   // Send a keepalive to prevent connection timeout.
   scp_error_t Keepalive();
