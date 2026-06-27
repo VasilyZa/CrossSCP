@@ -136,7 +136,7 @@ scp_error_t SshConnection::CreateSocket(const char* host, uint16_t port,
         struct timeval tv;
         tv.tv_sec = timeout_s;
         tv.tv_usec = 0;
-        ret = select(0, nullptr, &wset, nullptr, &tv);
+        ret = select(socket_.fd + 1, nullptr, &wset, nullptr, &tv);
         if (ret <= 0) {
           SCP_LOG_WARN("[%s]:%u  addr#%d %s: connect timeout after %us",
                        host, port, addr_idx, ipstr, timeout_s);
